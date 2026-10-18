@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+build/
+dist/
+
+# data and bulky outputs stay local
+data/
+runs/
+*.wav
+*.npy
+*.npz
+*.rar
+*.gif
+*.mp4
+
+# small audio-free reports ARE committed
+!reports/
+!reports/**
