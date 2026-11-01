@@ -25,11 +25,11 @@ from pathlib import Path
 import numpy as np
 import scipy.io.wavfile as wf
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, roc_auc_score
 
 from . import circor
 from .features import RingAccumulator, spectral_features, trivial_features
-from .metrics import aggregate_patients
+from .metrics import aggregate_patients, patient_mean_proba
 from .preprocess import PreprocessParams, preprocess, quality_flags, read_wav
 from .runlog import (MANIFEST_FIELDS, PRED_BASE_FIELDS, RunLog, new_run_dir, sha256_file)
 from .simulator import SimParams, derived, iter_frames, reliable_band_hz
@@ -80,27 +80,44 @@ def _features_for_file(args):
     return relpath, triv, spec, ring, q, False
 
 
-def _fit_predict(X, y, tr, te, seed, classes, shuffle_train_labels=False):
-    """Return (predicted labels, probability matrix with one column per entry of `classes`)."""
+def _fit_predict(X, y, tr, te, seed, classes, shuffle_train_labels=False, balance=False):
+    """Return (predicted labels, probability matrix with one column per entry of `classes`).
+
+    balance=True is for imbalanced targets (CirCor murmur: about 20% Present).  The forest is grown with
+    balanced_subsample class weights AND the returned probabilities are divided by the training-set class
+    frequencies and renormalised, so the argmax decision treats every class equally instead of always
+    predicting the majority.  Predictions are always the argmax of the returned probabilities.
+    """
     ytr = y[tr].copy()
     if shuffle_train_labels:
         ytr = np.random.default_rng(seed).permutation(ytr)
-    clf = RandomForestClassifier(n_estimators=300, min_samples_leaf=3, random_state=seed, n_jobs=1)
+    clf = RandomForestClassifier(n_estimators=300, min_samples_leaf=3, random_state=seed, n_jobs=1,
+                                 class_weight="balanced_subsample" if balance else None)
     clf.fit(X[tr], ytr)
     p = clf.predict_proba(X[te])
     proba = np.zeros((len(te), len(classes)))
     for j, c in enumerate(clf.classes_):
         proba[:, classes.index(c)] = p[:, j]
-    return clf.predict(X[te]), proba
+    if balance:
+        prior = np.array([(ytr == c).mean() for c in classes])
+        proba = proba / np.maximum(prior, 1e-9)
+        proba = proba / np.maximum(proba.sum(axis=1, keepdims=True), 1e-300)
+    return np.array(classes, dtype=object)[np.argmax(proba, axis=1)], proba
 
 
 def run_smoke(data_root: str, out_root: str = "runs", name: str = "smoke", seed: int = 0,
               n_splits: int = 5, max_per_class: int | None = None, workers: int = 1,
               groups_csv: str | None = None, sim_overrides: dict | None = None,
               pre_overrides: dict | None = None, repo_dir: str | None = None,
-              dataset: str = "folders", target: str = "outcome", excerpt_s: float = 4.0) -> Path:
+              dataset: str = "folders", target: str = "outcome", excerpt_s: float = 4.0,
+              balance: str = "auto") -> Path:
     if dataset not in ("folders", "circor"):
         raise ValueError(f"unknown dataset layout {dataset!r}")
+    if balance not in ("auto", "on", "off"):
+        raise ValueError(f"balance must be auto, on or off, got {balance!r}")
+    # auto: on for CirCor (imbalanced murmur task), off for the balanced folder datasets so earlier
+    # Yaseen runs stay reproducible
+    bal = balance == "on" or (balance == "auto" and dataset == "circor")
     t0 = time.time()
     run_dir = new_run_dir(out_root, name)
     rl = RunLog(run_dir, repo_dir=repo_dir)
@@ -222,32 +239,43 @@ def run_smoke(data_root: str, out_root: str = "runs", name: str = "smoke", seed:
     for k, tr, te in grouped_folds(y, groups, n_splits=n_splits, seed=seed):
         fold_of[te] = k
         for mname, (fset, shuf) in model_defs.items():
-            preds[mname][te], probas[mname][te] = _fit_predict(Xs[fset], y, tr, te, seed + k, classes, shuf)
+            preds[mname][te], probas[mname][te] = _fit_predict(Xs[fset], y, tr, te, seed + k, classes, shuf, bal)
         rl.log(f"fold {k+1}/{n_splits} done")
 
-    def headline(yt, yp):
+    def auroc(yt, proba):
+        """One-vs-rest AUROC per class (scikit-learn), averaged over classes present on both sides."""
+        yt = np.asarray(yt)
+        vals = [roc_auc_score(yt == c, proba[:, j]) for j, c in enumerate(classes)
+                if 0 < (yt == c).sum() < len(yt)]
+        return float(np.mean(vals)) if vals else float("nan")
+
+    def headline(yt, yp, proba):
         return dict(accuracy=float(accuracy_score(yt, yp)),
                     balanced_accuracy=float(balanced_accuracy_score(yt, yp)),
-                    macro_f1=float(f1_score(yt, yp, labels=classes, average="macro")))
+                    macro_f1=float(f1_score(yt, yp, labels=classes, average="macro")),
+                    auroc=auroc(yt, proba))
 
     patients = [m["patient"] for m in manifest] if is_circor else None
     rows = []
     metrics = {"classes": classes, "models": {}}
     for mname in model_defs:
         yp = preds[mname]
-        metrics["models"][mname] = headline(y, yp)
+        metrics["models"][mname] = headline(y, yp, probas[mname])
         for i, sid in enumerate(ids):
             row = dict(model=mname, id=sid, fold=int(fold_of[i]), y_true=y[i], y_pred=yp[i])
             row.update({f"proba_{c}": float(probas[mname][i, j]) for j, c in enumerate(classes)})
             rows.append(row)
         msg = (f"{mname:18s} acc={metrics['models'][mname]['accuracy']:.4f} "
-               f"bal_acc={metrics['models'][mname]['balanced_accuracy']:.4f}")
+               f"bal_acc={metrics['models'][mname]['balanced_accuracy']:.4f} "
+               f"auroc={metrics['models'][mname]['auroc']:.4f}")
         if is_circor:
             _, pt, py = aggregate_patients(patients, ids, list(y), probas[mname], classes)
-            pl = headline(pt, py)
+            _, _, pmean = patient_mean_proba(patients, ids, list(y), probas[mname])
+            pl = headline(pt, py, pmean)
             pl["n"] = len(pt)
             metrics["models"][mname]["patient_level"] = pl
-            msg += f"   | per patient (n={len(pt)}) bal_acc={pl['balanced_accuracy']:.4f}"
+            msg += (f"   | per patient (n={len(pt)}) bal_acc={pl['balanced_accuracy']:.4f} "
+                    f"auroc={pl['auroc']:.4f}")
         rl.log(msg)
 
     cfg = dict(seed=seed, n_splits=n_splits, data_root_name=Path(data_root).name,
@@ -255,7 +283,8 @@ def run_smoke(data_root: str, out_root: str = "runs", name: str = "smoke", seed:
                controls={"spectral": "spectral_shuffled", "sim": "sim_shuffled"},
                preprocess=pre.to_dict(), sim=sim.to_dict(),
                sim_derived=dict(d, reliable_band_hz_5pct=reliable),
-               classifier="RandomForest(300, min_samples_leaf=3)",
+               classifier=("RandomForest(300, min_samples_leaf=3, balanced_subsample + prior-corrected decision)"
+                           if bal else "RandomForest(300, min_samples_leaf=3)"), balance=bal,
                warnings=warnings, workers=workers, max_per_class=max_per_class,
                cache_key=_cfg_key(pre.to_dict(), sim.to_dict()),
                dataset=dataset, seconds=round(time.time() - t0, 1))

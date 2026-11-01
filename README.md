@@ -66,6 +66,10 @@ python -m heartsim smoke --dataset circor --target murmur  --data-root data/circ
 appear under two ids (CSV column *Additional ID*) are merged into one group. A patient's prediction is the class
 with the highest mean probability over their recordings (`metrics.aggregate_patients`).
 Read the `patient_level` numbers, not the per-recording ones, and read them next to `trivial` and `meta`.
+`--balance auto` (default for CirCor) grows class-balanced forests and corrects the decision for the training class
+frequencies, because the murmur target is about 20% Present and a plain forest answers "Absent" almost every time.
+Every model also reports **AUROC** (one-vs-rest, macro), which does not depend on a decision threshold; `verify`
+recomputes it with a separate rank-based implementation, per recording and per patient.
 
 Options worth knowing: `--grid-n`, `--band-hi`, `--groups-csv file.csv` (columns `file,group`;
 provide patient or recording-database ids whenever the dataset has them), `--max-per-class N`

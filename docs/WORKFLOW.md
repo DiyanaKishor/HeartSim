@@ -24,7 +24,7 @@ Do the `--max-per-class 100` pass first (a few minutes) to catch path/format pro
 The Yaseen run measured about 0.3 CPU-seconds per second of audio, so a 4 s excerpt costs roughly 1 CPU-second and
 the full public set roughly 1 CPU-hour; with `--workers 4` expect about 20-30 min (estimate, not measured on CirCor).
 The log prints an ETA. Features are cached, so a repeat is fast.
-`verify` also checks one label and one group per patient, recomputes the per-patient scores from
+`verify` also checks one label and one group per patient, recomputes AUROC, recomputes the per-patient scores from
 `predictions.csv`, and compares every model with both the `trivial` (recording properties) and `meta`
 (no audio at all) baselines.
 

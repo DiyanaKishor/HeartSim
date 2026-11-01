@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .metrics import HEADLINE_KEYS, aggregate_patients, summarize
+from .metrics import HEADLINE_KEYS, aggregate_patients, macro_auroc, patient_mean_proba, summarize
 from .runlog import sha256_file
 
 REQUIRED_FILES = ["config.json", "env.json", "manifest.csv", "predictions.csv", "metrics.json"]
@@ -140,6 +140,17 @@ def verify_run(run_dir, data_root=None, tol: float = 1e-9) -> Report:
         else:
             rep.add(f"metrics recomputed [{m}]", "PASS",
                     f"acc={s['accuracy']:.4f} bal_acc={s['balanced_accuracy']:.4f} macro_f1={s['macro_f1']:.4f}")
+        rep_auc = metrics["models"][m].get("auroc")
+        pcols_m = [f"proba_{c}" for c in classes]
+        if rep_auc is not None and all(c in sub.columns for c in pcols_m) and not sub[pcols_m].isna().any().any():
+            a = macro_auroc(sub["y_true"].tolist(), sub[pcols_m].to_numpy(), classes)
+            recomputed[m]["auroc"] = a
+            if abs(float(rep_auc) - a) > tol:
+                rep.add(f"auroc recomputed [{m}]", "FAIL", f"reported {float(rep_auc):.6f} vs recomputed {a:.6f}")
+            else:
+                rep.add(f"auroc recomputed [{m}]", "PASS", f"auroc={a:.4f}")
+        elif rep_auc is not None:
+            rep.add(f"auroc recomputed [{m}]", "FAIL", "auroc reported but probability columns are missing in predictions.csv")
 
     # --- group leakage across folds ------------------------------------------------------
     for m in models:
@@ -256,6 +267,10 @@ def verify_run(run_dir, data_root=None, tol: float = 1e-9) -> Report:
                 continue
             s = summarize(pt, py, classes)
             worst = max(abs(float(reported[k]) - s[k]) for k in HEADLINE_KEYS)
+            if reported.get("auroc") is not None:
+                _, _, pmean = patient_mean_proba([patient_of[i] for i in sub["id"]], sub["id"].tolist(),
+                                                 sub["y_true"].tolist(), sub[pcols].to_numpy())
+                worst = max(worst, abs(float(reported["auroc"]) - macro_auroc(pt, pmean, classes)))
             if worst > tol or int(reported.get("n", -1)) != s["n"]:
                 rep.add(f"patient-level metrics [{m}]", "FAIL",
                         f"reported vs recomputed differ by up to {worst:.3g} (n reported {reported.get('n')}, recomputed {s['n']})")

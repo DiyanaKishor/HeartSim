@@ -216,3 +216,64 @@ def test_murmur_target_runs_too(tmp_path):
     rep = verify_run(run, data_root=tmp_path / "data")
     assert rep.ok, rep.text()
     assert json.loads((run / "metrics.json").read_text())["classes"] == ["Absent", "Present"]
+
+
+# ----------------------------------------------------------------------------- AUROC and class weights
+def test_macro_auroc_matches_sklearn_including_ties():
+    from sklearn.metrics import roc_auc_score
+    from heartsim.metrics import macro_auroc
+    r = np.random.default_rng(1)
+    y = r.choice(["a", "b", "c"], 300)
+    P = np.round(r.dirichlet([1, 1, 1], 300), 1)
+    P = P / P.sum(axis=1, keepdims=True)                   # many exact ties on purpose
+    want = np.mean([roc_auc_score(y == c, P[:, j]) for j, c in enumerate("abc")])
+    assert macro_auroc(y, P, ["a", "b", "c"]) == pytest.approx(want, abs=1e-12)
+    assert np.isnan(macro_auroc(["x", "x"], np.array([[1.0, 0.0], [1.0, 0.0]]), ["x", "y"]))
+
+
+def test_balancing_raises_minority_recall_on_imbalanced_data():
+    from heartsim.smoke import _fit_predict
+    r = np.random.default_rng(0)
+    n = 600
+    y = np.where(r.random(n) < 0.12, "Present", "Absent")
+    X = r.standard_normal((n, 6))
+    X[y == "Present", 0] += 0.9                            # weak but real signal
+    classes = ["Absent", "Present"]
+    tr, te = np.arange(0, 400), np.arange(400, n)
+    plain, p_plain = _fit_predict(X, y, tr, te, 0, classes, False, False)
+    bal, p_bal = _fit_predict(X, y, tr, te, 0, classes, False, True)
+    rec = lambda yp: np.mean(yp[y[te] == "Present"] == "Present")
+    assert rec(plain) < 0.3 < rec(bal)                     # plain forest ignores the minority, balanced does not
+    assert (bal == np.array(classes)[p_bal.argmax(axis=1)]).all()      # predictions are the argmax of the probabilities
+    assert np.allclose(p_bal.sum(axis=1), 1.0)
+
+
+def test_run_reports_auroc_and_verify_recomputes_it(circor_run, tmp_path):
+    import shutil
+    _, _, _, run = circor_run
+    rep = verify_run(run)
+    assert rep.ok, rep.text()
+    assert status(rep, "auroc recomputed") == ["PASS"] * 6
+    m = json.loads((run / "metrics.json").read_text())
+    assert all("auroc" in v and "auroc" in v["patient_level"] for v in m["models"].values())
+    cfg = json.loads((run / "config.json").read_text())
+    assert cfg["balance"] is True and "prior-corrected" in cfg["classifier"]
+    r = tmp_path / "tampered"
+    shutil.copytree(run, r)
+    m["models"]["sim"]["auroc"] = 0.99
+    (r / "metrics.json").write_text(json.dumps(m))
+    assert status(verify_run(r), "auroc recomputed [sim]") == ["FAIL"]
+    m = json.loads((run / "metrics.json").read_text())
+    m["models"]["sim"]["patient_level"]["auroc"] += 0.05
+    (r / "metrics.json").write_text(json.dumps(m))
+    assert status(verify_run(r), "patient-level metrics [sim]") == ["FAIL"]
+
+
+def test_folder_datasets_keep_unweighted_forests_by_default(tmp_path):
+    from helpers import write_synth_dataset
+    data = write_synth_dataset(tmp_path / "data", n_per_class=12, n_classes=3)
+    r = run_smoke(str(data), str(tmp_path / "runs"), "f", seed=3, n_splits=3, sim_overrides=SIM, repo_dir=str(tmp_path))
+    assert json.loads((r / "config.json").read_text())["balance"] is False
+    rep = verify_run(r, data_root=data)
+    assert rep.ok, rep.text()
+    assert status(rep, "auroc recomputed")                  # AUROC is reported for every dataset layout

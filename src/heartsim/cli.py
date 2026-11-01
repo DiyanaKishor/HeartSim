@@ -38,6 +38,8 @@ def main(argv=None) -> int:
     s.add_argument("--dataset", choices=["folders", "circor"], default="folders",
                    help="folders: <root>/<CLASS>/*.wav (Yaseen).  circor: <root>/training_data.csv + training_data/")
     s.add_argument("--target", choices=["outcome", "murmur"], default="outcome", help="circor label to predict")
+    s.add_argument("--balance", choices=["auto", "on", "off"], default="auto",
+                   help="class-balanced forests + prior-corrected decisions; auto = on for circor, off for folder datasets")
     s.add_argument("--excerpt-s", type=float, default=4.0,
                    help="circor: seconds simulated per recording, starting at the first S1")
 
@@ -70,7 +72,8 @@ def main(argv=None) -> int:
         pre = {"band_hi_hz": a.band_hi} if a.band_hi else {}
         run_smoke(a.data_root, a.out_root, a.name, a.seed, a.n_splits, a.max_per_class,
                   a.workers, a.groups_csv, sim, pre, repo_dir=".",
-                  dataset=a.dataset, target=a.target, excerpt_s=a.excerpt_s)
+                  dataset=a.dataset, target=a.target, excerpt_s=a.excerpt_s,
+                  balance=a.balance)
         return 0
 
     if a.cmd == "verify":
