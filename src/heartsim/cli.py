@@ -2,6 +2,7 @@
 
   env                       print hardware/software report and sizing notes
   smoke --data-root DIR     run the baseline harness on <DIR>/<CLASS>/*.wav
+                            (--dataset circor: CirCor DigiScope layout, patient-grouped)
   verify RUN_DIR            independently re-check a run folder (exit code 1 on FAIL)
   compare RUN_A RUN_B       check two runs produced identical predictions (same seed/config)
   report RUN_DIR            write an audio-free zip of the run folder
@@ -34,6 +35,11 @@ def main(argv=None) -> int:
     s.add_argument("--groups-csv", default=None, help="csv with columns file,group (patient/database ids)")
     s.add_argument("--grid-n", type=int, default=None)
     s.add_argument("--band-hi", type=float, default=None)
+    s.add_argument("--dataset", choices=["folders", "circor"], default="folders",
+                   help="folders: <root>/<CLASS>/*.wav (Yaseen).  circor: <root>/training_data.csv + training_data/")
+    s.add_argument("--target", choices=["outcome", "murmur"], default="outcome", help="circor label to predict")
+    s.add_argument("--excerpt-s", type=float, default=4.0,
+                   help="circor: seconds simulated per recording, starting at the first S1")
 
     v = sub.add_parser("verify")
     v.add_argument("run_dir")
@@ -63,7 +69,8 @@ def main(argv=None) -> int:
         sim = {"grid_n": a.grid_n} if a.grid_n else {}
         pre = {"band_hi_hz": a.band_hi} if a.band_hi else {}
         run_smoke(a.data_root, a.out_root, a.name, a.seed, a.n_splits, a.max_per_class,
-                  a.workers, a.groups_csv, sim, pre, repo_dir=".")
+                  a.workers, a.groups_csv, sim, pre, repo_dir=".",
+                  dataset=a.dataset, target=a.target, excerpt_s=a.excerpt_s)
         return 0
 
     if a.cmd == "verify":

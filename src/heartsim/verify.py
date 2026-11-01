@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .metrics import HEADLINE_KEYS, summarize
+from .metrics import HEADLINE_KEYS, aggregate_patients, summarize
 from .runlog import sha256_file
 
 REQUIRED_FILES = ["config.json", "env.json", "manifest.csv", "predictions.csv", "metrics.json"]
@@ -195,41 +195,89 @@ def verify_run(run_dir, data_root=None, tol: float = 1e-9) -> Report:
                     f"control balanced accuracy {ba:.3f} is above chance {chance:.3f} + {band:.3f}: leakage or a bug")
         else:
             rep.add(f"shuffled control for [{real}]", "PASS", f"{ba:.3f} (chance {chance:.3f}, band +{band:.3f})")
-    real_models = [m for m in models if m not in controls.values()]
+    triv = cfg.get("trivial_baseline")
+    baselines = list(cfg.get("baselines") or ([triv] if triv else []))
+    real_models = [m for m in models if m not in controls.values() and m not in baselines]
     for m in real_models:
-        if m not in controls and m != cfg.get("trivial_baseline"):     # the baseline is a floor, not a claim
+        if m not in controls:
             rep.add(f"shuffled control for [{m}]", "WARN", "no shuffled-label control registered")
 
-    # --- trivial-feature baseline ----------------------------------------------------------
-    triv = cfg.get("trivial_baseline")
-    if triv and triv in recomputed:
-        tb = recomputed[triv]["balanced_accuracy"]
+    # --- baselines: recording properties (trivial) and, for CirCor, patient metadata (meta) ---
+    if not (triv and triv in recomputed):
+        rep.add("trivial baseline", "WARN", "no trivial-feature baseline registered, results cannot be put in context")
+    for b in baselines:
+        if b not in recomputed:
+            continue
+        kind = "trivial baseline" if b == triv else f"{b} baseline"
+        what = "non-cardiac-features" if b == triv else "no-audio"
+        bb = recomputed[b]["balanced_accuracy"]
         for m in real_models:
-            if m == triv or m not in recomputed:
+            if m not in recomputed:
                 continue
             ba = recomputed[m]["balanced_accuracy"]
-            if ba <= tb + 0.02:
-                rep.add(f"beats trivial baseline [{m}]", "WARN",
-                        f"bal_acc {ba:.3f} vs non-cardiac-features baseline {tb:.3f}: no clear gain over a dataset shortcut")
+            if ba <= bb + 0.02:
+                rep.add(f"beats {kind} [{m}]", "WARN",
+                        f"bal_acc {ba:.3f} vs {what} baseline {bb:.3f}: no clear gain over a dataset shortcut")
             else:
-                rep.add(f"beats trivial baseline [{m}]", "PASS", f"{ba:.3f} vs {tb:.3f}")
-        if tb > chance + 0.25:
-            rep.add("dataset shortcut level", "WARN",
-                    f"non-cardiac features alone reach balanced accuracy {tb:.3f} (chance {chance:.3f}); "
-                    "the label is partly predictable from recording properties")
-    else:
-        rep.add("trivial baseline", "WARN", "no trivial-feature baseline registered, results cannot be put in context")
+                rep.add(f"beats {kind} [{m}]", "PASS", f"{ba:.3f} vs {bb:.3f}")
+        if bb > chance + 0.25:
+            rep.add("dataset shortcut level" if b == triv else f"{b} shortcut level", "WARN",
+                    f"{what} features alone reach balanced accuracy {bb:.3f} (chance {chance:.3f}); "
+                    "the label is partly predictable without the heart sound itself")
+
+    # --- patient-level structure and scores (CirCor-style runs) ----------------------------
+    if "patient" in man.columns:
+        pat = man["patient"].astype(str)
+        multi = man.groupby(pat)["label"].nunique()
+        if (multi > 1).any():
+            rep.add("one label per patient", "FAIL", f"{int((multi > 1).sum())} patient(s) have recordings with different labels")
+        else:
+            rep.add("one label per patient", "PASS", f"{pat.nunique()} patients")
+        pg = man.groupby(pat)["group"].nunique()
+        if (pg > 1).any():
+            rep.add("one group per patient", "FAIL", f"{int((pg > 1).sum())} patient(s) are spread over several groups")
+        else:
+            rep.add("one group per patient", "PASS")
+        patient_of = dict(zip(man["id"], pat))
+        pcols = [f"proba_{c}" for c in classes]
+        for m in models:
+            reported = metrics["models"][m].get("patient_level")
+            if reported is None:
+                continue
+            sub = pred[pred["model"] == m].sort_values("id")
+            if not all(c in sub.columns for c in pcols) or sub[pcols].isna().any().any():
+                rep.add(f"patient-level metrics [{m}]", "FAIL", "per-class probability columns missing in predictions.csv")
+                continue
+            try:
+                _, pt, py = aggregate_patients([patient_of[i] for i in sub["id"]], sub["id"].tolist(),
+                                               sub["y_true"].tolist(), sub[pcols].to_numpy(), classes)
+            except ValueError as e:
+                rep.add(f"patient-level metrics [{m}]", "FAIL", str(e))
+                continue
+            s = summarize(pt, py, classes)
+            worst = max(abs(float(reported[k]) - s[k]) for k in HEADLINE_KEYS)
+            if worst > tol or int(reported.get("n", -1)) != s["n"]:
+                rep.add(f"patient-level metrics [{m}]", "FAIL",
+                        f"reported vs recomputed differ by up to {worst:.3g} (n reported {reported.get('n')}, recomputed {s['n']})")
+            else:
+                rep.add(f"patient-level metrics [{m}]", "PASS",
+                        f"n={s['n']} acc={s['accuracy']:.4f} bal_acc={s['balanced_accuracy']:.4f} macro_f1={s['macro_f1']:.4f}")
 
     # --- data checksums ---------------------------------------------------------------------
     if data_root:
         root = Path(data_root)
         bad = missing_f = 0
+        has_aux = "aux_relpath" in man.columns and "aux_sha256" in man.columns
         for _, r in man.iterrows():
-            p = root / r["relpath"]
-            if not p.exists():
-                missing_f += 1
-            elif sha256_file(p) != r["sha256"]:
-                bad += 1
+            pairs = [(r["relpath"], r["sha256"])]
+            if has_aux:
+                pairs.append((r["aux_relpath"], r["aux_sha256"]))
+            for rel, want in pairs:
+                p = root / rel
+                if not p.exists():
+                    missing_f += 1
+                elif sha256_file(p) != want:
+                    bad += 1
         if bad:
             rep.add("data checksums", "FAIL", f"{bad} file(s) differ from the manifest")
         elif missing_f:

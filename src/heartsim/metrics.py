@@ -44,3 +44,29 @@ def summarize(y_true, y_pred, classes) -> dict:
 
 
 HEADLINE_KEYS = ("accuracy", "balanced_accuracy", "macro_f1")
+
+
+def aggregate_patients(patients, ids, y_true, proba, classes):
+    """Recording-level -> patient-level.  A patient's prediction is the class with the highest
+    MEAN probability over their recordings (mean rounded to 9 decimals, ties go to the class that
+    comes first in `classes`).  Used both by the training code and by verify.py: the metric
+    arithmetic is independent, this decision rule is the one shared definition.
+
+    Returns (patient_ids, y_true_per_patient, y_pred_per_patient), sorted by patient id.
+    Raises ValueError if one patient carries two different labels.
+    """
+    proba = np.asarray(proba, dtype=np.float64)
+    order = sorted(range(len(ids)), key=lambda i: (str(patients[i]), str(ids[i])))
+    by_pat: dict[str, list[int]] = {}
+    for i in order:
+        by_pat.setdefault(str(patients[i]), []).append(i)
+    out_p, out_t, out_y = [], [], []
+    for p, idx in by_pat.items():
+        labels = {y_true[i] for i in idx}
+        if len(labels) != 1:
+            raise ValueError(f"patient {p} has more than one label: {sorted(labels)}")
+        mean = np.round(proba[idx].mean(axis=0), 9)
+        out_p.append(p)
+        out_t.append(labels.pop())
+        out_y.append(classes[int(np.argmax(mean))])
+    return out_p, out_t, out_y

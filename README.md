@@ -5,8 +5,9 @@ open/absorbing edges). The resulting height field is summarised and used for cla
 The code is arranged so that **every reported number can be re-derived and sanity-checked
 by someone who does not trust the person or model that produced it.**
 
-Status: research scaffold, version 0.1. It runs end to end on a laptop CPU with classical
-classifiers. It does **not** yet contain heartbeat segmentation or a CNN, and nothing in
+Status: research scaffold, version 0.2. It runs end to end on a laptop CPU with classical
+classifiers, on Yaseen (smoke test) and CirCor (patient-grouped). It does **not** yet contain per-cycle
+montages or a CNN, and nothing in
 this repository demonstrates diagnostic value yet. See *Known limitations*.
 
 ## Install
@@ -27,6 +28,17 @@ python -m heartsim env         # hardware report + sizing notes (paste this to y
 data/yaseen/N/*.wav   data/yaseen/AS/*.wav   data/yaseen/MR/*.wav   data/yaseen/MS/*.wav   data/yaseen/MVP/*.wav
 ```
 
+CirCor DigiScope (the dataset to use for real claims; open access, about 450 MB zipped, the public
+60% training part, 3,163 recordings):
+
+```
+data/circor/training_data.csv
+data/circor/training_data/<patient>_<AV|MV|PV|TV|...>.wav / .tsv / .hea
+```
+
+Download: `https://physionet.org/content/circor-heart-sound/1.0.3/` (zip is served from S3; `curl.exe -L -C -`
+resumes an interrupted download).
+
 The Yaseen files ship as `.rar` archives in
 [the dataset repo](https://github.com/yaseen21khan/Classification-of-Heart-Sound-Signal-Using-Multiple-Features-).
 Extract with 7-Zip/WinRAR, or `node scripts/extract_yaseen.cjs <dir with rars> data/yaseen`
@@ -41,6 +53,19 @@ Extract with 7-Zip/WinRAR, or `node scripts/extract_yaseen.cjs <dir with rars> d
 | `python -m heartsim compare runs/<a> runs/<b>` | same seed/config/data must give identical predictions |
 | `python -m heartsim report runs/<run>` | audio-free zip (config, env, manifest, predictions, metrics, log) |
 | `python -m heartsim env` | CPU/RAM/GPU/package versions and sizing advice |
+
+CirCor run (patient-grouped folds, one `--excerpt-s` excerpt per recording starting at the first annotated S1,
+a `meta` baseline that uses only age/sex/height/weight/pregnancy/campaign/location, and per-patient scores):
+
+```
+python -m heartsim smoke --dataset circor --target outcome --data-root data/circor --workers 4 --name circor_outcome
+python -m heartsim smoke --dataset circor --target murmur  --data-root data/circor --workers 4 --name circor_murmur
+```
+
+`--target outcome` (Normal/Abnormal) is the screening label; `murmur` drops the Unknown rows. Patients that
+appear under two ids (CSV column *Additional ID*) are merged into one group. A patient's prediction is the class
+with the highest mean probability over their recordings (`metrics.aggregate_patients`).
+Read the `patient_level` numbers, not the per-recording ones, and read them next to `trivial` and `meta`.
 
 Options worth knowing: `--grid-n`, `--band-hi`, `--groups-csv file.csv` (columns `file,group`;
 provide patient or recording-database ids whenever the dataset has them), `--max-per-class N`
@@ -78,14 +103,17 @@ means "internally consistent and the guards held".
 * **Yaseen is a smoke test only.** It has no patient ids, clips from varied sources, and a random forest on
   non-cardiac features (loudness, duration, silence, DC) reached 97% in 5-fold CV. Always read results next to the
   `trivial` model. Use a dataset with patient/database ids (CirCor, PhysioNet 2016) for any real claim.
-* **Not implemented yet:** S1/S2 segmentation and per-cycle montages, leave-one-database-out runs,
+* **CirCor caveats.** Only the public 60% is used, so numbers are not comparable with the Challenge's hidden
+  set. Murmur and Outcome are patient-level labels (a recording from a patient with a murmur may not contain one).
+  Only one excerpt per recording is simulated; the S1/S2 `.tsv` is used to place it, not yet to build per-cycle montages.
+* **Not implemented yet:** per-cycle montages from the S1/S2 annotations, leave-one-database-out runs,
   random-radial-filter control (does the physics matter at all?), CNN training, calibration to hardware.
 * Frame storage is not needed and not done: about 70 MB per second of audio at grid 140. Features are streamed.
 
 ## Layout
 
 ```
-src/heartsim/  simulator.py preprocess.py features.py splits.py metrics.py runlog.py verify.py smoke.py env.py report.py cli.py
+src/heartsim/  simulator.py preprocess.py features.py splits.py metrics.py runlog.py verify.py smoke.py circor.py env.py report.py cli.py
 tests/         regression tests, incl. the boundary-reflection and frame-timing defects found in the audit
 docs/WORKFLOW.md   the local-run + review loop
 scripts/       extract_yaseen.cjs
